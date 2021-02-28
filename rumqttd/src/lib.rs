@@ -15,11 +15,24 @@ use crate::remotelink::RemoteLink;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::{signal, task, time};
+
+// All requirements for `rustls`
+#[cfg(feature = "use-rustls")]
 use tokio_rustls::rustls::internal::pemfile::{certs, rsa_private_keys};
+#[cfg(feature = "use-rustls")]
 use tokio_rustls::rustls::{
     AllowAnyAuthenticatedClient, NoClientAuth, RootCertStore, ServerConfig, TLSError,
 };
+#[cfg(feature = "use-rustls")]
 use tokio_rustls::TlsAcceptor;
+
+// All requirements for `native-tls`
+#[cfg(feature = "use-native-tls")]
+use std::io::Read;
+#[cfg(feature = "use-native-tls")]
+use tokio_native_tls::native_tls::Error as TLSError;
+#[cfg(feature = "use-native-tls")]
+use tokio_native_tls::{native_tls, TlsAcceptor};
 
 pub mod async_locallink;
 mod consolelink;
@@ -31,9 +44,11 @@ mod state;
 use crate::consolelink::ConsoleLink;
 pub use crate::locallink::{LinkError, LinkRx, LinkTx};
 use crate::network::Network;
+#[cfg(feature = "use-rustls")]
 use crate::Error::ServerKeyNotFound;
 use std::collections::HashMap;
 use std::fs::File;
+#[cfg(feature = "use-rustls")]
 use std::io::BufReader;
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +102,10 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ServerSettings {
     pub port: u16,
+    /// Used only for native-tls implementation
+    pub pkcs12_path: Option<String>,
+    /// Used only for native-tls implementation
+    pub pkcs12_pass: Option<String>,
     pub ca_path: Option<String>,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
@@ -222,6 +241,40 @@ impl Server {
         }
     }
 
+    #[cfg(feature = "use-native-tls")]
+    fn tls(&self) -> Result<Option<TlsAcceptor>, Error> {
+        match (
+            self.config.pkcs12_path.clone(),
+            self.config.pkcs12_pass.clone(),
+        ) {
+            (Some(cert), Some(password)) => {
+                // Get certificates
+                let cert_file = File::open(&cert);
+                let mut cert_file =
+                    cert_file.map_err(|_| Error::ServerCertNotFound(cert.clone()))?;
+
+                // Read cert into memory
+                let mut buf = Vec::new();
+                cert_file
+                    .read_to_end(&mut buf)
+                    .map_err(|_| Error::InvalidServerCert(cert.clone()))?;
+
+                // Get the identity
+                let identity = native_tls::Identity::from_pkcs12(&buf, &password)
+                    .map_err(|_| Error::InvalidServerCert(cert.clone()))?;
+
+                // Builder
+                let builder = native_tls::TlsAcceptor::builder(identity).build()?;
+
+                // Create acceptor
+                let acceptor = TlsAcceptor::from(builder);
+                Ok(Some(acceptor))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "use-rustls")]
     fn tls(&self) -> Result<Option<TlsAcceptor>, Error> {
         let (certs, key) = match self.config.cert_path.clone() {
             Some(cert) => {
@@ -286,7 +339,8 @@ impl Server {
             let network = match &acceptor {
                 Some(acceptor) => {
                     info!("{}. Accepting TLS connection from: {}", count, addr);
-                    Network::new(acceptor.accept(stream).await?, max_incoming_size)
+                    let sock = acceptor.accept(stream).await?;
+                    Network::new(sock, max_incoming_size)
                 }
                 None => {
                     info!("{}. Accepting TCP connection from: {}", count, addr);
